@@ -140,17 +140,33 @@ def proxy_label(url: str) -> str:
 def with_random_port(proxy_url: str, ports: list[int] | None = None) -> str:
     """
     Keep host + auth + scheme, replace port with a random one.
-    Original port is included in the candidate set so it can still be chosen.
+    SKIP (return original) when:
+      - proxy has username/password (auth gateways like decodo/brightdata break on wrong port)
+      - hostname looks like a known sticky gateway
+    Original port is always kept in the candidate set.
     """
     ports = ports or RANDOM_PORTS
     p = urlparse(proxy_url)
     if not p.hostname:
         return proxy_url
+
+    host = (p.hostname or "").lower()
+    # Auth / residential gateways: port is part of the product endpoint — do not randomize
+    gateway_markers = (
+        "decodo.", "brightdata.", "luminati.", "oxylabs.", "smartproxy.",
+        "iproyal.", "soax.", "netnut.", "packetstream.", "proxy-seller.",
+        "webshare.", "geonode.", "proxyrack.", "stormproxy.", "infatica.",
+        "gate.", "gw.", "resi.", "residential.", "premium.",
+    )
+    if p.username is not None or any(m in host for m in gateway_markers):
+        return proxy_url
+
     candidates = list(ports)
     if p.port and p.port not in candidates:
         candidates.append(p.port)
     new_port = random.choice(candidates)
-    # rebuild netloc with auth if present
+    if p.port and new_port == p.port:
+        return proxy_url
     if p.username is not None:
         user = quote(p.username, safe="")
         if p.password is not None:
@@ -517,7 +533,7 @@ def main() -> None:
         "--random-port",
         action="store_true",
         default=False,
-        help="ON: each try uses a random port on the proxy host (default OFF)",
+        help="ON: randomize port on IP:PORT proxies only (skipped for user:pass / gateway hosts). Default OFF",
     )
     ap.add_argument(
         "--no-random-port",
@@ -571,6 +587,14 @@ def main() -> None:
     else:
         print("[!] no proxies — direct IP (24h free-key limit per IP)")
     print(f"[*] rotates      : proxy{' +port' if random_port else ''}, deviceId, hw, UA, lang, cookies, WhatsApp")
+    if random_port and pool:
+        authish = 0
+        for u in pool.base_proxies:
+            pu = urlparse(u)
+            if pu.username or any(x in (pu.hostname or "").lower() for x in ("gate.", "decodo", "bright", "oxy", "resi")):
+                authish += 1
+        if authish:
+            print(f"[!] note         : {authish}/{len(pool)} proxies look like auth gateways — random-port auto-skipped for those")
     print("-" * 64)
 
     saved = 0
