@@ -137,46 +137,87 @@ def proxy_label(url: str) -> str:
         return url[:48]
 
 
+def is_gateway_host(host: str) -> bool:
+    host = (host or "").lower()
+    markers = (
+        "decodo.", "brightdata.", "luminati.", "oxylabs.", "smartproxy.",
+        "iproyal.", "soax.", "netnut.", "packetstream.", "proxy-seller.",
+        "webshare.", "geonode.", "proxyrack.", "stormproxy.", "infatica.",
+        "gate.", "gw.", "resi.", "residential.", "premium.", "superproxy.",
+        "proxy.nova", "packetstream", "nspproxy", "proxycheap",
+    )
+    return any(m in host for m in markers)
+
+
 def with_random_port(proxy_url: str, ports: list[int] | None = None) -> str:
-    """
-    Keep host + auth + scheme, replace port with a random one.
-    SKIP (return original) when:
-      - proxy has username/password (auth gateways like decodo/brightdata break on wrong port)
-      - hostname looks like a known sticky gateway
-    Original port is always kept in the candidate set.
-    """
+    """Randomize port on plain IP proxies only. Auth gateways keep exact port."""
     ports = ports or RANDOM_PORTS
     p = urlparse(proxy_url)
     if not p.hostname:
         return proxy_url
-
-    host = (p.hostname or "").lower()
-    # Auth / residential gateways: port is part of the product endpoint — do not randomize
-    gateway_markers = (
-        "decodo.", "brightdata.", "luminati.", "oxylabs.", "smartproxy.",
-        "iproyal.", "soax.", "netnut.", "packetstream.", "proxy-seller.",
-        "webshare.", "geonode.", "proxyrack.", "stormproxy.", "infatica.",
-        "gate.", "gw.", "resi.", "residential.", "premium.",
-    )
-    if p.username is not None or any(m in host for m in gateway_markers):
+    if p.username is not None or is_gateway_host(p.hostname):
         return proxy_url
-
     candidates = list(ports)
     if p.port and p.port not in candidates:
         candidates.append(p.port)
     new_port = random.choice(candidates)
-    if p.port and new_port == p.port:
-        return proxy_url
-    if p.username is not None:
-        user = quote(p.username, safe="")
-        if p.password is not None:
-            password = quote(p.password, safe="")
-            netloc = f"{user}:{password}@{p.hostname}:{new_port}"
-        else:
-            netloc = f"{user}@{p.hostname}:{new_port}"
-    else:
-        netloc = f"{p.hostname}:{new_port}"
+    netloc = f"{p.hostname}:{new_port}"
     return urlunparse((p.scheme or "http", netloc, "", "", "", ""))
+
+
+def with_rotated_session(proxy_url: str) -> str:
+    """
+    Rotate exit IP on residential/auth gateways by rewriting username session id.
+    Supports common patterns:
+      user-session-XXXX / user_session-XXXX / user-sessid-XXXX
+      user-country-xx-session-XXXX
+      plain username  ->  username-session-<rand>
+    Port and password stay the same (required for Decodo etc.).
+    """
+    p = urlparse(proxy_url)
+    if not p.hostname or p.username is None:
+        return proxy_url
+
+    user = p.username
+    password = p.password or ""
+    # generate sticky-but-new session id
+    sess = uuid.uuid4().hex[:12]
+    sess_alt = str(random.randint(100000, 999999999))
+
+    # strip existing session tokens then append fresh one
+    # patterns: -session-xxx, _session-xxx, -sessid-xxx, -sid-xxx
+    base_user = re.sub(
+        r"([-_]?(?:session|sessid|sid|sess)[-_]?)[A-Za-z0-9]+",
+        "",
+        user,
+        flags=re.I,
+    )
+    base_user = base_user.rstrip("-_")
+
+    # Decodo / many providers: username-session-ID
+    # Also try session-ID only suffix
+    style = random.choice(["session", "session", "sessid"])
+    new_user = f"{base_user}-{style}-{sess}"
+
+    user_q = quote(new_user, safe="")
+    pass_q = quote(password, safe="")
+    port = p.port or (1080 if (p.scheme or "").startswith("socks") else 8080)
+    netloc = f"{user_q}:{pass_q}@{p.hostname}:{port}"
+    return urlunparse((p.scheme or "socks5h", netloc, "", "", "", ""))
+
+
+def rotate_proxy(proxy_url: str, random_port: bool = False, ports: list[int] | None = None) -> str:
+    """
+    Master rotator:
+      - gateway/auth proxies  -> session-id rotation (new exit IP), keep port
+      - plain ip:port         -> optional random port if enabled
+    """
+    p = urlparse(proxy_url)
+    if p.username is not None or is_gateway_host(p.hostname or ""):
+        return with_rotated_session(proxy_url)
+    if random_port:
+        return with_random_port(proxy_url, ports)
+    return proxy_url
 
 
 # ---------------------------------------------------------------------------
@@ -465,23 +506,15 @@ class ProxyPool:
         self.idx = (self.idx + 1) % len(alive_base)
         base = alive_base[self.idx]
 
-        if self.random_port:
-            # try up to 8 random ports until one not in bad set
-            for _ in range(8):
-                candidate = with_random_port(base, self.port_list)
-                if candidate not in self.bad:
-                    return candidate
-            return with_random_port(base, self.port_list)
-
-        if base in self.bad:
-            # skip to another base
-            for _ in range(len(alive_base)):
-                self.idx = (self.idx + 1) % len(alive_base)
-                base = alive_base[self.idx]
-                if base not in self.bad:
-                    return base
-            return base
-        return base
+        # Always apply session/port rotation so each request can get a new exit IP
+        for _ in range(10):
+            candidate = rotate_proxy(base, random_port=self.random_port, ports=self.port_list)
+            if candidate not in self.bad:
+                return candidate
+            # session rotate again / next base
+            self.idx = (self.idx + 1) % len(alive_base)
+            base = alive_base[self.idx]
+        return rotate_proxy(base, random_port=self.random_port, ports=self.port_list)
 
     def mark_bad(self, proxy: str | None, kill_host: bool = False) -> None:
         if not proxy:
@@ -586,15 +619,16 @@ def main() -> None:
         print(f"[*] sample proxy : {proxy_label(pool.base_proxies[0])}")
     else:
         print("[!] no proxies — direct IP (24h free-key limit per IP)")
-    print(f"[*] rotates      : proxy{' +port' if random_port else ''}, deviceId, hw, UA, lang, cookies, WhatsApp")
-    if random_port and pool:
-        authish = 0
-        for u in pool.base_proxies:
-            pu = urlparse(u)
-            if pu.username or any(x in (pu.hostname or "").lower() for x in ("gate.", "decodo", "bright", "oxy", "resi")):
-                authish += 1
+    print(f"[*] rotates      : proxy + session/IP, deviceId, hw, UA, lang, cookies, WhatsApp")
+    if pool:
+        authish = sum(
+            1 for u in pool.base_proxies
+            if urlparse(u).username or is_gateway_host(urlparse(u).hostname or "")
+        )
         if authish:
-            print(f"[!] note         : {authish}/{len(pool)} proxies look like auth gateways — random-port auto-skipped for those")
+            print(f"[*] session-rot  : ON for {authish}/{len(pool)} gateway proxies (new session id = new exit IP)")
+        if random_port:
+            print(f"[*] random-port  : applied only to plain ip:port proxies")
     print("-" * 64)
 
     saved = 0
@@ -626,6 +660,9 @@ def main() -> None:
 
         assert res is not None
         rate_limited = bool(res.get("error") and "24 hours" in str(res.get("error")))
+        if rate_limited and used_proxy:
+            # burn this exit session so next request forces a new session id / IP
+            pool.mark_bad(used_proxy, kill_host=False)
 
         if args.verbose:
             print(f"         hw={res.get('hw')} device={res.get('device_id')}")
