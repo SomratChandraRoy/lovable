@@ -165,7 +165,7 @@ def with_random_port(proxy_url: str, ports: list[int] | None = None) -> str:
     return urlunparse((p.scheme or "http", netloc, "", "", "", ""))
 
 
-def with_rotated_session(proxy_url: str) -> str:
+def with_rotated_session(proxy_url: str, session_format: str = "{user}-session-{sess}") -> str:
     """
     Rotate exit IP on residential/auth gateways by rewriting username session id.
     Supports common patterns:
@@ -196,8 +196,10 @@ def with_rotated_session(proxy_url: str) -> str:
 
     # Decodo / many providers: username-session-ID
     # Also try session-ID only suffix
-    style = random.choice(["session", "session", "sessid"])
-    new_user = f"{base_user}-{style}-{sess}"
+    try:
+        new_user = session_format.format(user=base_user, sess=sess, sess_num=sess_alt)
+    except Exception:
+        new_user = f"{base_user}-session-{sess}"
 
     user_q = quote(new_user, safe="")
     pass_q = quote(password, safe="")
@@ -206,16 +208,24 @@ def with_rotated_session(proxy_url: str) -> str:
     return urlunparse((p.scheme or "socks5h", netloc, "", "", "", ""))
 
 
-def rotate_proxy(proxy_url: str, random_port: bool = False, ports: list[int] | None = None) -> str:
+def rotate_proxy(
+    proxy_url: str,
+    random_port: bool = False,
+    session_rot: bool = False,
+    ports: list[int] | None = None,
+    session_format: str = "{user}-session-{sess}",
+) -> str:
     """
     Master rotator:
-      - gateway/auth proxies  -> session-id rotation (new exit IP), keep port
-      - plain ip:port         -> optional random port if enabled
+      - session_rot ON + auth/gateway -> rewrite username session id
+      - random_port ON + plain ip     -> random port
+      - default                       -> return proxy unchanged (safest for Decodo)
     """
     p = urlparse(proxy_url)
-    if p.username is not None or is_gateway_host(p.hostname or ""):
-        return with_rotated_session(proxy_url)
-    if random_port:
+    is_auth = p.username is not None or is_gateway_host(p.hostname or "")
+    if session_rot and is_auth and p.username:
+        return with_rotated_session(proxy_url, session_format=session_format)
+    if random_port and not is_auth:
         return with_random_port(proxy_url, ports)
     return proxy_url
 
@@ -476,12 +486,14 @@ def dynamic_wait(base: float, attempt: int, success: bool, rate_limited: bool, p
 
 
 class ProxyPool:
-    def __init__(self, proxies: list[str], random_port: bool = False, port_list: list[int] | None = None):
+    def __init__(self, proxies: list[str], random_port: bool = False, session_rot: bool = False, port_list: list[int] | None = None, session_format: str = "{user}-session-{sess}"):
         self.base_proxies = list(proxies)
-        self.bad: set[str] = set()          # exact URL (with port) marked bad
-        self.bad_hosts: set[str] = set()    # host fully dead
+        self.bad: set[str] = set()
+        self.bad_hosts: set[str] = set()
         self.idx = 0
         self.random_port = random_port
+        self.session_rot = session_rot
+        self.session_format = session_format
         self.port_list = port_list or RANDOM_PORTS
         random.shuffle(self.base_proxies)
 
@@ -508,13 +520,13 @@ class ProxyPool:
 
         # Always apply session/port rotation so each request can get a new exit IP
         for _ in range(10):
-            candidate = rotate_proxy(base, random_port=self.random_port, ports=self.port_list)
+            candidate = rotate_proxy(base, random_port=self.random_port, session_rot=self.session_rot, ports=self.port_list, session_format=self.session_format)
             if candidate not in self.bad:
                 return candidate
             # session rotate again / next base
             self.idx = (self.idx + 1) % len(alive_base)
             base = alive_base[self.idx]
-        return rotate_proxy(base, random_port=self.random_port, ports=self.port_list)
+        return rotate_proxy(base, random_port=self.random_port, session_rot=self.session_rot, ports=self.port_list, session_format=self.session_format)
 
     def mark_bad(self, proxy: str | None, kill_host: bool = False) -> None:
         if not proxy:
@@ -574,6 +586,18 @@ def main() -> None:
         help="explicitly force random-port OFF",
     )
     ap.add_argument(
+        "--session-rot",
+        action="store_true",
+        default=False,
+        help="ON: rotate username session-id on gateways (Decodo etc). Default OFF — can break auth if format wrong",
+    )
+    ap.add_argument(
+        "--session-format",
+        type=str,
+        default="{user}-session-{sess}",
+        help="username format for --session-rot. Tokens: {user} {sess} {sess_num}. Example: {user}-session-{sess}",
+    )
+    ap.add_argument(
         "--ports",
         type=str,
         default="",
@@ -603,7 +627,9 @@ def main() -> None:
     if not args.no_proxy:
         proxies = load_proxies(proxy_path, default_scheme=args.proxy_scheme)
 
-    pool = ProxyPool(proxies, random_port=random_port, port_list=port_list)
+    session_rot = bool(getattr(args, 'session_rot', False))
+    session_format = getattr(args, 'session_format', '{user}-session-{sess}')
+    pool = ProxyPool(proxies, random_port=random_port, session_rot=session_rot, port_list=port_list, session_format=session_format)
     dedupe = args.dedupe and not args.no_dedupe
     seen_keys = load_existing_keys(out) if dedupe else None
 
@@ -625,8 +651,10 @@ def main() -> None:
             1 for u in pool.base_proxies
             if urlparse(u).username or is_gateway_host(urlparse(u).hostname or "")
         )
-        if authish:
-            print(f"[*] session-rot  : ON for {authish}/{len(pool)} gateway proxies (new session id = new exit IP)")
+        if session_rot and authish:
+            print(f"[*] session-rot  : ON for {authish}/{len(pool)} gateways (format={session_format!r})")
+        elif authish and not session_rot:
+            print(f"[*] session-rot  : OFF (safe). Use --session-rot only if your provider supports session in username")
         if random_port:
             print(f"[*] random-port  : applied only to plain ip:port proxies")
     print("-" * 64)
